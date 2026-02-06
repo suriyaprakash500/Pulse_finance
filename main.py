@@ -74,6 +74,36 @@ class CategoryInferResponse(BaseModel):
     category: str
 
 
+class TransactionForAnalysis(BaseModel):
+    """Single transaction for subscription analysis."""
+    merchant: str
+    amount: float
+    date: str  # ISO format date string
+    category: Optional[str] = None
+
+
+class SubscriptionDetectRequest(BaseModel):
+    """Request model for subscription detection."""
+    transactions: List[TransactionForAnalysis]
+
+
+class DetectedSubscription(BaseModel):
+    """A detected recurring subscription."""
+    merchant_name: str
+    average_amount: float
+    frequency: str  # WEEKLY, MONTHLY, QUARTERLY, YEARLY
+    last_payment_date: str
+    next_predicted_date: str
+    confidence: float
+    category: str
+
+
+class SubscriptionDetectResponse(BaseModel):
+    """Response model for subscription detection."""
+    subscriptions: List[DetectedSubscription]
+    analysis_summary: str
+
+
 # ============== PROMPTS ==============
 
 SMS_PARSE_PROMPT = """
@@ -163,6 +193,45 @@ Rules:
 - Respond with ONLY the category name, nothing else
 - Use exact category names from the list above
 - If uncertain, respond with "Other"
+"""
+
+SUBSCRIPTION_DETECT_PROMPT = """
+You are a financial analyst AI. Analyze this transaction history to detect RECURRING payments (subscriptions, bills, EMIs, rent).
+
+Transaction History:
+{transactions}
+
+Your Task:
+1. Group transactions by merchant name (normalize similar names like "NETFLIX" and "Netflix India").
+2. Identify merchants with REGULAR payment patterns (weekly, monthly, quarterly, yearly).
+3. For each recurring payment, determine:
+   - The frequency (WEEKLY, MONTHLY, QUARTERLY, YEARLY)
+   - Average amount
+   - When the next payment is likely due
+   - Category (Entertainment, Bills, Food, Transport, Health, Education, Other)
+
+Rules:
+- Only include merchants with 2+ payments at regular intervals.
+- Ignore one-time purchases.
+- Common subscriptions: Netflix, Spotify, Prime, Hotstar, Gym, Insurance, EMI, Rent, Electricity, Mobile recharge.
+- Bills pattern: Usually same amount ± 10% variation.
+- Be conservative - only flag clear patterns.
+
+Respond in JSON format:
+{{
+  "subscriptions": [
+    {{
+      "merchant_name": "string",
+      "average_amount": number,
+      "frequency": "MONTHLY" | "WEEKLY" | "QUARTERLY" | "YEARLY",
+      "last_payment_date": "YYYY-MM-DD",
+      "next_predicted_date": "YYYY-MM-DD",
+      "confidence": 0.0 to 1.0,
+      "category": "string"
+    }}
+  ],
+  "analysis_summary": "Brief 1-2 sentence summary of findings"
+}}
 """
 
 
@@ -353,9 +422,65 @@ async def infer_category(request: CategoryInferRequest):
         return CategoryInferResponse(category="Other")
 
 
+@app.post("/api/detect-subscriptions", response_model=SubscriptionDetectResponse)
+async def detect_subscriptions(request: SubscriptionDetectRequest):
+    """
+    Analyze transaction history to detect recurring subscriptions and bills.
+    Uses AI to identify patterns and predict next due dates.
+    """
+    # Format transactions for the AI prompt
+    transactions_str = "\n".join([
+        f"- {t.date}: {t.merchant} - ₹{t.amount}" + (f" ({t.category})" if t.category else "")
+        for t in request.transactions
+    ])
+    
+    prompt = SUBSCRIPTION_DETECT_PROMPT.format(transactions=transactions_str)
+    
+    try:
+        response = get_ai_response(prompt)
+        parsed = parse_json_response(response)
+        
+        if parsed and "subscriptions" in parsed:
+            subscriptions = []
+            for sub in parsed.get("subscriptions", []):
+                try:
+                    subscriptions.append(DetectedSubscription(
+                        merchant_name=sub.get("merchant_name", "Unknown"),
+                        average_amount=float(sub.get("average_amount", 0)),
+                        frequency=sub.get("frequency", "MONTHLY"),
+                        last_payment_date=sub.get("last_payment_date", ""),
+                        next_predicted_date=sub.get("next_predicted_date", ""),
+                        confidence=float(sub.get("confidence", 0.5)),
+                        category=sub.get("category", "Other")
+                    ))
+                except (ValueError, KeyError) as e:
+                    print(f"Error parsing subscription: {e}")
+                    continue
+            
+            return SubscriptionDetectResponse(
+                subscriptions=subscriptions,
+                analysis_summary=parsed.get("analysis_summary", f"Found {len(subscriptions)} recurring payment(s).")
+            )
+        
+        # Default empty response
+        return SubscriptionDetectResponse(
+            subscriptions=[],
+            analysis_summary="No recurring payments detected."
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Detect subscriptions error: {e}")
+        return SubscriptionDetectResponse(
+            subscriptions=[],
+            analysis_summary=f"Analysis failed: {str(e)}"
+        )
+
+
 # ============== MAIN ==============
 
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8000))
     uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
+
